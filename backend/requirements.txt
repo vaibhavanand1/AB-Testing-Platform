@@ -1,0 +1,23 @@
+# Web framework and ASGI server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# Database and ORM
+sqlalchemy>=2.0.36
+psycopg2-binary>=2.9.10
+alembic>=1.14.0
+
+# Caching
+redis>=5.2.0
+
+# Validation and settings
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+
+# Statistical calculations
+scipy>=1.14.1
+numpy>=2.1.0
+
+# Testing and benchmarking client
+httpx>=0.28.0
+pytest>=8.3.0
