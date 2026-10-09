@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import List, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class VariantDef(BaseModel):
@@ -28,14 +28,13 @@ class ExperimentCreate(BaseModel):
 
 
 class ExperimentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     variants: List[VariantDef]
     status: str
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class AssignmentResponse(BaseModel):
@@ -53,15 +52,14 @@ class EventCreate(BaseModel):
 
 
 class EventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     experiment_id: int
     user_id: str
     variant: str
     event_type: str
     timestamp: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class VariantResult(BaseModel):

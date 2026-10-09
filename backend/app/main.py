@@ -1,13 +1,18 @@
-from typing import List
+import asyncio
+from contextlib import asynccontextmanager
+import json
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 import redis
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from app.database import get_db, get_redis
+from app.buffer import get_buffer_length, get_dlq_length, log_exposure_event
+from app.config import settings
+from app.database import SessionLocal, get_db, get_redis
 from app.hashing import get_or_assign_variant
-from app.models import Assignment, Event, Experiment
+from app.models import Assignment, Event, Experiment, Exposure
 from app.schemas import (
     AssignmentResponse,
     EventCreate,
@@ -17,12 +22,31 @@ from app.schemas import (
     ExperimentResultsResponse,
 )
 from app.stats import compute_experiment_results
+from app.worker import ExposureWorker
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: launch background write-behind worker
+    worker = ExposureWorker()
+    worker_task = asyncio.create_task(worker.run_loop())
+    app.state.exposure_worker = worker
+    yield
+    # Shutdown: graceful drain of in-flight buffered exposures
+    await worker.stop()
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+
 
 app = FastAPI(
     title="A/B Testing Platform API",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -62,6 +86,7 @@ def health_check(
 def create_experiment(
     payload: ExperimentCreate,
     db: Session = Depends(get_db),
+    redis_client: redis.Redis = Depends(get_redis),
 ):
     existing = db.query(Experiment).filter(Experiment.name == payload.name).first()
     if existing:
@@ -78,6 +103,22 @@ def create_experiment(
     db.add(experiment)
     db.commit()
     db.refresh(experiment)
+
+    # Pre-cache experiment metadata in Redis
+    try:
+        redis_client.setex(
+            f"experiment:meta:{experiment.id}",
+            settings.cache_ttl_seconds,
+            json.dumps({
+                "id": experiment.id,
+                "name": experiment.name,
+                "status": experiment.status,
+                "variants": experiment.variants,
+            }),
+        )
+    except redis.RedisError:
+        pass
+
     return experiment
 
 
@@ -110,18 +151,105 @@ def get_experiment(
     return experiment
 
 
+class CachedExperiment:
+    def __init__(self, id: int, name: str, status: str, variants: list):
+        self.id = id
+        self.name = name
+        self.status = status
+        self.variants = variants
+
+
+def get_cached_experiment(
+    redis_client: redis.Redis,
+    experiment_id: int,
+) -> Optional[CachedExperiment]:
+    cache_key = f"experiment:meta:{experiment_id}"
+    try:
+        raw = redis_client.get(cache_key)
+        if raw:
+            data = json.loads(raw)
+            return CachedExperiment(
+                id=data["id"],
+                name=data["name"],
+                status=data["status"],
+                variants=data["variants"],
+            )
+    except redis.RedisError:
+        pass
+
+    with SessionLocal() as db:
+        experiment = db.query(Experiment).filter(Experiment.id == experiment_id).first()
+        if not experiment:
+            return None
+
+        cached = CachedExperiment(
+            id=experiment.id,
+            name=experiment.name,
+            status=experiment.status,
+            variants=experiment.variants,
+        )
+
+    try:
+        redis_client.set(
+            cache_key,
+            json.dumps({
+                "id": cached.id,
+                "name": cached.name,
+                "status": cached.status,
+                "variants": cached.variants,
+            }),
+            ex=settings.cache_ttl_seconds,
+        )
+    except redis.RedisError:
+        pass
+
+    return cached
+
+
+def get_or_assign_variant_cached(
+    redis_client: redis.Redis,
+    experiment: CachedExperiment,
+    user_id: str,
+) -> Tuple[str, bool]:
+    cache_key = f"assignment:{experiment.id}:{user_id}"
+
+    # 1. Fast path: check Redis cache
+    try:
+        cached_variant = redis_client.get(cache_key)
+        if cached_variant is not None:
+            variant_str = (
+                cached_variant.decode("utf-8")
+                if isinstance(cached_variant, bytes)
+                else cached_variant
+            )
+            return variant_str, True
+    except redis.RedisError:
+        pass
+
+    # 2. Cache miss: fallback to DB
+    with SessionLocal() as db:
+        return get_or_assign_variant(
+            db=db,
+            redis_client=redis_client,
+            experiment=experiment,
+            user_id=user_id,
+        )
+
+
 @app.get(
     "/assign",
     response_model=AssignmentResponse,
     status_code=status.HTTP_200_OK,
 )
-def assign_user(
+async def assign_user(
     experiment_id: int = Query(..., description="Target experiment ID"),
     user_id: str = Query(..., min_length=1, description="Unique user identifier"),
-    db: Session = Depends(get_db),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    experiment = db.query(Experiment).filter(Experiment.id == experiment_id).first()
+    experiment = get_cached_experiment(
+        redis_client=redis_client,
+        experiment_id=experiment_id,
+    )
     if not experiment:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -134,11 +262,18 @@ def assign_user(
             detail=f"Experiment '{experiment.name}' is not active (status: {experiment.status})",
         )
 
-    variant, from_cache = get_or_assign_variant(
-        db=db,
+    variant, from_cache = get_or_assign_variant_cached(
         redis_client=redis_client,
         experiment=experiment,
         user_id=user_id,
+    )
+
+    # Low-latency write-behind exposure logging (<0.5ms non-blocking push to Redis buffer)
+    log_exposure_event(
+        redis_client=redis_client,
+        experiment_id=experiment.id,
+        user_id=user_id,
+        variant=variant,
     )
 
     return AssignmentResponse(
@@ -147,6 +282,45 @@ def assign_user(
         variant=variant,
         from_cache=from_cache,
     )
+
+
+@app.get(
+    "/evaluate",
+    response_model=AssignmentResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def evaluate_user(
+    experiment_id: int = Query(..., description="Target experiment ID"),
+    user_id: str = Query(..., min_length=1, description="Unique user identifier"),
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """
+    Sub-millisecond variant evaluation endpoint with asynchronous write-behind exposure logging.
+    Direct alias for /assign conforming to standard experimentation service contracts.
+    """
+    return await assign_user(
+        experiment_id=experiment_id,
+        user_id=user_id,
+        redis_client=redis_client,
+    )
+
+
+@app.get(
+    "/buffer/stats",
+    status_code=status.HTTP_200_OK,
+)
+def get_buffer_stats(
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """
+    Diagnostic endpoint returning real-time Redis exposure buffer depth and DLQ count.
+    """
+    return {
+        "buffer_key": settings.exposure_buffer_key,
+        "buffered_exposures": get_buffer_length(redis_client),
+        "dlq_key": settings.exposure_dlq_key,
+        "dlq_count": get_dlq_length(redis_client),
+    }
 
 
 @app.post(

@@ -41,6 +41,10 @@ services:
       CACHE_TTL_SECONDS: 86400
       MIN_SAMPLE_SIZE_PER_VARIANT: 100
       SIGNIFICANCE_ALPHA: 0.05
+      EXPOSURE_BATCH_SIZE: 500
+      EXPOSURE_BATCH_INTERVAL_SECONDS: 2.0
+      EXPOSURE_BUFFER_KEY: experiment:exposure_buffer
+      EXPOSURE_DLQ_KEY: experiment:exposure_dlq
     ports:
       - "8000:8000"
     depends_on:

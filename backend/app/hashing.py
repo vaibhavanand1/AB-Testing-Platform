@@ -1,5 +1,5 @@
 import hashlib
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 import redis
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -31,7 +31,7 @@ def compute_variant(experiment_id: int, user_id: str, variants: List[Dict[str, A
 def get_or_assign_variant(
     db: Session,
     redis_client: redis.Redis,
-    experiment: Experiment,
+    experiment: Union[Experiment, Any],
     user_id: str,
 ) -> Tuple[str, bool]:
     cache_key = f"assignment:{experiment.id}:{user_id}"
@@ -88,7 +88,7 @@ def get_or_assign_variant(
 
     # 4. Write-back to Redis cache with TTL
     try:
-        redis_client.setex(cache_key, settings.cache_ttl_seconds, variant)
+        redis_client.set(cache_key, variant, ex=settings.cache_ttl_seconds)
     except redis.RedisError:
         pass
 

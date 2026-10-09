@@ -1,3 +1,4 @@
+from annotated_types import MaxLen
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from sqlalchemy import (
@@ -66,3 +67,32 @@ class Event(Base):
         Index("idx_events_exp_user", "experiment_id", "user_id"),
         Index("idx_events_exp_variant_type", "experiment_id", "variant", "event_type"),
     )
+
+
+class Exposure(Base):
+    __tablename__ = "exposures"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("experiments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    variant: Mapped[str] = mapped_column(String(100), nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    metadata_: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        "metadata",
+        JSONType,
+        nullable=True,
+    )
+
+    __table_args__ = (
+        Index("idx_exposures_exp_variant_ts", "experiment_id", "variant", "timestamp"),
+        Index("idx_exposures_exp_user", "experiment_id", "user_id"),
+    )
+

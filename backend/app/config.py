@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 86400
     min_sample_size_per_variant: int = 100
     significance_alpha: float = 0.05
+    exposure_buffer_key: str = "experiment:exposure_buffer"
+    exposure_dlq_key: str = "experiment:exposure_dlq"
+    exposure_batch_size: int = 500
+    exposure_batch_interval_seconds: float = 2.0
+    exposure_max_retries: int = 3
 
     model_config = SettingsConfigDict(
         env_file=(".env", "../.env"),
